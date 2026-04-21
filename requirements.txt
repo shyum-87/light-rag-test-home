@@ -1,0 +1,16 @@
+# LightRAG core + OpenAI provider
+# (최신 버전을 쓰고 싶으면 버전 고정 없이 lightrag-hku만 써도 됨)
+lightrag-hku>=1.4.0
+
+# OpenAI SDK는 lightrag-hku가 자동으로 의존성으로 설치해주지만,
+# 명시적으로 최신을 맞추고 싶을 때:
+openai>=1.40.0
+
+# Ollama 로컬 버전을 같이 쓰고 싶으면:
+ollama>=0.3.0
+
+# 주피터 노트북에서 돌릴 경우 (async 충돌 방지)
+nest-asyncio>=1.6.0
+
+# .env 파일 자동 로드
+python-dotenv>=1.0.0
