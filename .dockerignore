@@ -1,0 +1,11 @@
+.venv/
+venv/
+rag_storage/
+rag_storage_ollama/
+rag_storage_onprem/
+__pycache__/
+*.pyc
+.env
+.git/
+.claude/
+lightrag.log
