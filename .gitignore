@@ -9,6 +9,11 @@ rag_storage_ollama/
 
 # 비밀 정보
 .env
+.env.onprem
+
+
+# 폐쇄망용 저장소
+rag_storage_onprem/
 
 # 파이썬 캐시
 __pycache__/
