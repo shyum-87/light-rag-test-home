@@ -26,6 +26,9 @@ __pycache__/
 .idea/
 *.swp
 
+# Docker 이미지 (용량 큼, USB로 별도 복사)
+*.tar
+
 # OS
 .DS_Store
 Thumbs.db
