@@ -7,13 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# wheels 먼저 복사해서 Docker 레이어 캐시 활용
-COPY wheels_cp312/ /tmp/wheels/
+# requirements 먼저 복사해서 Docker 레이어 캐시 활용
+# (소스가 바뀌어도 패키지 재설치 불필요)
 COPY requirements.lock .
 
-# 오프라인 설치 (인터넷 불필요)
-RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels/ -r requirements.lock && \
-    rm -rf /tmp/wheels/
+# 인터넷에서 패키지 설치 (빌드는 인터넷 되는 PC에서 수행)
+# 빌드 완료된 이미지(.tar)를 폐쇄망으로 옮기므로 이후 인터넷 불필요
+RUN pip install --no-cache-dir -r requirements.lock
 
 # 소스 코드 복사
 COPY sample_doc.txt .
