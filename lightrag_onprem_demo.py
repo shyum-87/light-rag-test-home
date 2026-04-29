@@ -16,7 +16,7 @@ import shutil
 import aiohttp
 import logging
 from pathlib import Path
-from functools import partial
+from openai import AsyncOpenAI
 
 # .env 파일 자동 로드
 try:
@@ -27,9 +27,8 @@ except ImportError:
     pass
 
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.kg.shared_storage import initialize_pipeline_status
-from lightrag.utils import EmbeddingFunc, setup_logger
+from lightrag.utils import EmbeddingFunc, Tokenizer, setup_logger
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +44,16 @@ LLM_CREDENTIAL_KEY = os.getenv("ONPREM_LLM_CREDENTIAL_KEY", "")
 LLM_SEND_SYSTEM_NAME = os.getenv("ONPREM_SEND_SYSTEM_NAME", "test_api_1")
 LLM_USER_ID = os.getenv("ONPREM_USER_ID", "")
 
-# 임베딩 — 사내에 별도 임베딩 서버가 있으면 설정, 없으면 LLM과 같은 base_url 사용
-EMBED_BASE_URL = os.getenv("ONPREM_EMBED_BASE_URL", LLM_BASE_URL)
-EMBED_MODEL = os.getenv("ONPREM_EMBED_MODEL", "text-embedding-3-small")
-EMBED_DIM = int(os.getenv("ONPREM_EMBED_DIM", "1536"))
-EMBED_CREDENTIAL_KEY = os.getenv("ONPREM_EMBED_CREDENTIAL_KEY", LLM_CREDENTIAL_KEY)
+# 임베딩 — 현재 사내 임베딩 API 미구축 상태를 고려해 로컬 Ollama 사용
+OLLAMA_BASE_URL = os.getenv("ONPREM_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_EMBED_MODEL = os.getenv("ONPREM_OLLAMA_EMBED_MODEL", "bge-m3:latest")
+EMBED_DIM = int(os.getenv("ONPREM_EMBED_DIM", "1024"))
+# tiktoken 모델명 고정 (폐쇄망에서 원격 tokenizer 다운로드 방지 목적)
+# 집(인터넷 가능) 환경에서 검증한 값으로 ONPREM_TIKTOKEN_MODEL 을 맞춰 사용하세요.
+TIKTOKEN_MODEL = os.getenv("ONPREM_TIKTOKEN_MODEL", "text-embedding-3-small")
+USE_OFFLINE_CHAR_TOKENIZER = (
+    os.getenv("ONPREM_USE_OFFLINE_CHAR_TOKENIZER", "true").lower() == "true"
+)
 
 # Reranker
 RERANK_BASE_URL = os.getenv(
@@ -79,6 +83,43 @@ def _build_llm_headers() -> dict:
         "Prompt-Msg-Id": str(uuid.uuid4()),
         "Completion-Msg-Id": str(uuid.uuid4()),
     }
+
+
+async def onprem_llm_complete(*args, **kwargs) -> str:
+    """
+    LightRAG 내부 호출 경로별 인자 차이를 흡수하는 LLM 래퍼.
+    """
+    prompt = kwargs.pop("prompt", None)
+    if prompt is None and len(args) >= 1:
+        prompt = args[0]
+    if prompt is None:
+        prompt = kwargs.pop("query", None) or kwargs.pop("user_prompt", None)
+    if prompt is None:
+        raise RuntimeError(
+            "LLM 호출에 prompt가 없어 요청을 처리할 수 없습니다. "
+            "LightRAG 호출 인자(prompt/query)를 확인하세요."
+        )
+
+    system_prompt = kwargs.pop("system_prompt", None)
+    history_messages = kwargs.pop("history_messages", None) or []
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": prompt})
+
+    client = AsyncOpenAI(
+        base_url=LLM_BASE_URL,
+        api_key="unused",
+        default_headers=_build_llm_headers(),
+    )
+    completion = await client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        timeout=kwargs.pop("timeout", None),
+    )
+    return completion.choices[0].message.content or ""
 
 
 # ------------------------------------------------------------------
@@ -129,6 +170,65 @@ async def onprem_rerank(
     return results
 
 
+async def ollama_embed(texts: list[str]) -> list[list[float]]:
+    """
+    폐쇄망 PC의 로컬 Ollama 임베딩 모델(bge-m3:latest 등)을 호출합니다.
+    """
+    endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
+    payload = {"model": OLLAMA_EMBED_MODEL, "input": texts}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(endpoint, json=payload) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.error(f"Ollama embed API error {resp.status}: {error_text}")
+                raise RuntimeError(
+                    f"Ollama embed API error {resp.status}: {error_text}"
+                )
+            data = await resp.json()
+
+    embeddings = data.get("embeddings")
+    if not embeddings:
+        raise RuntimeError(f"Ollama embed 응답에 embeddings가 없습니다: {data}")
+    return embeddings
+
+
+async def ensure_ollama_embed_model() -> None:
+    """
+    시작 전에 로컬 Ollama 모델 존재 여부를 확인해 404를 사전에 방지합니다.
+    """
+    endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(endpoint) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(
+                    f"Ollama 연결 실패({resp.status}): {body}\n"
+                    f"- ONPREM_OLLAMA_BASE_URL 확인: {OLLAMA_BASE_URL}"
+                )
+            data = await resp.json()
+
+    model_names = {m.get("name", "") for m in data.get("models", [])}
+    if OLLAMA_EMBED_MODEL not in model_names:
+        raise RuntimeError(
+            f"Ollama 모델 '{OLLAMA_EMBED_MODEL}' 이(가) 없습니다.\n"
+            f"사내 PC에서 먼저 실행하세요: ollama pull {OLLAMA_EMBED_MODEL}\n"
+            f"현재 설치 모델: {sorted([n for n in model_names if n])}"
+        )
+
+
+class OfflineCharTokenizer:
+    """
+    tiktoken 다운로드가 불가능한 폐쇄망 환경용 단순 문자 기반 토크나이저.
+    """
+
+    def encode(self, content: str) -> list[int]:
+        return [ord(ch) for ch in content]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(t) for t in tokens)
+
+
 # ------------------------------------------------------------------
 # LightRAG 초기화
 # ------------------------------------------------------------------
@@ -137,37 +237,28 @@ async def initialize_rag() -> LightRAG:
         shutil.rmtree(WORKING_DIR)
     WORKING_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 폐쇄망에서 tiktoken 원격 다운로드가 불가하면 문자 기반 토크나이저 사용
+    tokenizer = None
+    if USE_OFFLINE_CHAR_TOKENIZER:
+        tokenizer = Tokenizer(
+            model_name="offline-char-tokenizer",
+            tokenizer=OfflineCharTokenizer(),
+        )
+
     # 사내 LLM: openai_complete_if_cache + openai_client_configs 로 커스텀 헤더 전달
     rag = LightRAG(
         working_dir=str(WORKING_DIR),
+        tokenizer=tokenizer,
+        tiktoken_model_name=TIKTOKEN_MODEL,
         # --- LLM 설정 ---
-        llm_model_func=openai_complete_if_cache,
+        llm_model_func=onprem_llm_complete,
         llm_model_name=LLM_MODEL,
-        llm_model_kwargs={
-            "base_url": LLM_BASE_URL,
-            "api_key": "unused",  # 커스텀 헤더 인증이므로 임의 값
-            "openai_client_configs": {
-                "default_headers": _build_llm_headers(),
-            },
-        },
-        # --- 임베딩 설정 ---
+        llm_model_kwargs={},
+        # --- 임베딩 설정 (로컬 Ollama) ---
         embedding_func=EmbeddingFunc(
             embedding_dim=EMBED_DIM,
             max_token_size=8192,
-            func=partial(
-                openai_embed.func,
-                model=EMBED_MODEL,
-                base_url=EMBED_BASE_URL,
-                api_key="unused",
-                client_configs={
-                    "default_headers": {
-                        "x-dep-ticket": EMBED_CREDENTIAL_KEY,
-                        "Send-System-Name": LLM_SEND_SYSTEM_NAME,
-                        "User-Id": LLM_USER_ID,
-                        "User-Type": "AD_ID",
-                    },
-                },
-            ),
+            func=ollama_embed,
         ),
         # --- Reranker 설정 (선택) ---
         rerank_model_func=onprem_rerank if RERANK_CREDENTIAL_KEY else None,
@@ -182,7 +273,11 @@ async def index_document(rag: LightRAG) -> None:
     print(f"문서 로딩: {DOC_PATH}")
     text = DOC_PATH.read_text(encoding="utf-8")
     print("인덱싱 시작 (LLM이 엔티티/관계 추출 중)... 몇 분 걸릴 수 있음")
-    await rag.ainsert(text)
+    try:
+        await rag.ainsert(text)
+    except Exception:
+        print("인덱싱 실패: 임베딩/LLM 설정을 확인하세요.\n")
+        raise
     print("인덱싱 완료\n")
 
 
@@ -199,6 +294,7 @@ async def run_query(rag: LightRAG, question: str, mode: str) -> None:
 
 
 async def main() -> None:
+    await ensure_ollama_embed_model()
     rag = await initialize_rag()
     await index_document(rag)
 
