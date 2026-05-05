@@ -15,6 +15,11 @@ import asyncio
 import shutil
 import aiohttp
 import logging
+import numpy as np
+import json
+import importlib
+from datetime import datetime
+from collections import Counter
 from pathlib import Path
 from openai import AsyncOpenAI
 
@@ -41,19 +46,24 @@ LLM_BASE_URL = os.getenv(
 )
 LLM_MODEL = os.getenv("ONPREM_LLM_MODEL", "openai/gpt-oss-120b")
 LLM_CREDENTIAL_KEY = os.getenv("ONPREM_LLM_CREDENTIAL_KEY", "")
-LLM_SEND_SYSTEM_NAME = os.getenv("ONPREM_SEND_SYSTEM_NAME", "test_api_1")
+LLM_SEND_SYSTEM_NAME = os.getenv("ONPREM_SEND_SYSTEM_NAME", "")
 LLM_USER_ID = os.getenv("ONPREM_USER_ID", "")
 
 # 임베딩 — 현재 사내 임베딩 API 미구축 상태를 고려해 로컬 Ollama 사용
 OLLAMA_BASE_URL = os.getenv("ONPREM_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_EMBED_MODEL = os.getenv("ONPREM_OLLAMA_EMBED_MODEL", "bge-m3:latest")
 EMBED_DIM = int(os.getenv("ONPREM_EMBED_DIM", "1024"))
+CHUNK_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_TOKEN_SIZE", "800"))
+CHUNK_OVERLAP_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_OVERLAP_TOKEN_SIZE", "80"))
+MAX_EXTRACT_INPUT_TOKENS = int(os.getenv("ONPREM_MAX_EXTRACT_INPUT_TOKENS", "16000"))
 # tiktoken 모델명 고정 (폐쇄망에서 원격 tokenizer 다운로드 방지 목적)
 # 집(인터넷 가능) 환경에서 검증한 값으로 ONPREM_TIKTOKEN_MODEL 을 맞춰 사용하세요.
 TIKTOKEN_MODEL = os.getenv("ONPREM_TIKTOKEN_MODEL", "text-embedding-3-small")
 USE_OFFLINE_CHAR_TOKENIZER = (
     os.getenv("ONPREM_USE_OFFLINE_CHAR_TOKENIZER", "true").lower() == "true"
 )
+TOKENIZER_TYPE = os.getenv("ONPREM_TOKENIZER_TYPE", "char").lower()
+XLMR_TOKENIZER_PATH = os.getenv("ONPREM_XLMR_TOKENIZER_PATH", "./tokenizer")
 
 # Reranker
 RERANK_BASE_URL = os.getenv(
@@ -69,6 +79,7 @@ RERANK_TOP_N = int(os.getenv("ONPREM_RERANK_TOP_N", "5"))
 # ------------------------------------------------------------------
 WORKING_DIR = Path("./rag_storage_onprem")
 DOC_PATH = Path("./sample_doc.txt")
+BAD_EMBED_LOG_PATH: Path | None = None
 
 setup_logger("lightrag", level="WARNING")
 
@@ -170,27 +181,70 @@ async def onprem_rerank(
     return results
 
 
-async def ollama_embed(texts: list[str]) -> list[list[float]]:
+async def ollama_embed(texts: list[str]) -> np.ndarray:
     """
     폐쇄망 PC의 로컬 Ollama 임베딩 모델(bge-m3:latest 등)을 호출합니다.
     """
     endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
-    payload = {"model": OLLAMA_EMBED_MODEL, "input": texts}
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(endpoint, json=payload) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                logger.error(f"Ollama embed API error {resp.status}: {error_text}")
-                raise RuntimeError(
-                    f"Ollama embed API error {resp.status}: {error_text}"
+    async def _embed_batch(batch_texts: list[str]) -> list[list[float]]:
+        payload = {"model": OLLAMA_EMBED_MODEL, "input": batch_texts}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=payload) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(
+                        f"Ollama embed API error {resp.status}: {error_text}"
+                    )
+                data = await resp.json()
+        embeddings = data.get("embeddings")
+        if not embeddings:
+            raise RuntimeError(f"Ollama embed 응답에 embeddings가 없습니다: {data}")
+        return embeddings
+
+    try:
+        arr = np.array(await _embed_batch(texts), dtype=np.float32)
+        if not np.isfinite(arr).all():
+            raise RuntimeError("Ollama 임베딩 결과에 NaN/Inf가 포함되었습니다.")
+        return arr
+    except Exception as e:
+        msg = str(e)
+        if "unsupported value: NaN" not in msg and "NaN" not in msg:
+            logger.error(f"Ollama embed API error: {e}")
+            raise
+
+        logger.warning(
+            "Ollama 배치 임베딩에서 NaN 오류 발생. 단건 임베딩 fallback을 시도합니다."
+        )
+        vectors: list[np.ndarray] = []
+        bad_inputs: list[str] = []
+        for t in texts:
+            try:
+                single_arr = np.array(await _embed_batch([t]), dtype=np.float32)
+                vec = single_arr[0]
+                if not np.isfinite(vec).all():
+                    raise RuntimeError("single embedding contains NaN/Inf")
+                vectors.append(vec)
+            except Exception as single_e:
+                logger.error(
+                    f"단건 임베딩도 실패하여 zero-vector로 대체합니다: {single_e}"
                 )
-            data = await resp.json()
-
-    embeddings = data.get("embeddings")
-    if not embeddings:
-        raise RuntimeError(f"Ollama embed 응답에 embeddings가 없습니다: {data}")
-    return embeddings
+                bad_inputs.append(t)
+                vectors.append(np.zeros(EMBED_DIM, dtype=np.float32))
+        if bad_inputs:
+            target_log = BAD_EMBED_LOG_PATH or Path("./bad_embed_inputs.log")
+            counter = Counter(bad_inputs)
+            with target_log.open("a", encoding="utf-8") as f:
+                f.write("\n=== zero-vector fallback batch ===\n")
+                for idx, bad in enumerate(bad_inputs, start=1):
+                    f.write(f"[{idx}] {bad}\n")
+                f.write("--- count summary ---\n")
+                for text, cnt in counter.most_common():
+                    f.write(f"{cnt}x | {text}\n")
+            logger.warning(
+                f"zero-vector로 대체된 입력 {len(bad_inputs)}건을 {target_log}에 기록했습니다."
+            )
+        return np.vstack(vectors)
 
 
 async def ensure_ollama_embed_model() -> None:
@@ -217,6 +271,23 @@ async def ensure_ollama_embed_model() -> None:
         )
 
 
+async def ensure_llm_gateway_ready() -> None:
+    """
+    인덱싱 전에 LLM 게이트웨이 인증/헤더 설정이 유효한지 사전 점검합니다.
+    """
+    try:
+        await onprem_llm_complete(
+            prompt="ping",
+            system_prompt="You are a helpful assistant. Reply with one word.",
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "LLM 게이트웨이 사전 점검 실패. "
+            "ONPREM_SEND_SYSTEM_NAME / ONPREM_USER_ID / ONPREM_LLM_CREDENTIAL_KEY 값을 확인하세요.\n"
+            f"원인: {e}"
+        ) from e
+
+
 class OfflineCharTokenizer:
     """
     tiktoken 다운로드가 불가능한 폐쇄망 환경용 단순 문자 기반 토크나이저.
@@ -229,6 +300,23 @@ class OfflineCharTokenizer:
         return "".join(chr(t) for t in tokens)
 
 
+class HuggingFaceTokenizer:
+    """
+    로컬 Hugging Face tokenizer(xlm-roberta 등) 래퍼.
+    """
+
+    def __init__(self, model_path: str):
+        transformers = importlib.import_module("transformers")
+        auto_tokenizer = getattr(transformers, "AutoTokenizer")
+        self.tk = auto_tokenizer.from_pretrained(model_path, local_files_only=True)
+
+    def encode(self, content: str) -> list[int]:
+        return self.tk.encode(content, add_special_tokens=False)
+
+    def decode(self, tokens: list[int]) -> str:
+        return self.tk.decode(tokens, skip_special_tokens=True)
+
+
 # ------------------------------------------------------------------
 # LightRAG 초기화
 # ------------------------------------------------------------------
@@ -239,7 +327,12 @@ async def initialize_rag() -> LightRAG:
 
     # 폐쇄망에서 tiktoken 원격 다운로드가 불가하면 문자 기반 토크나이저 사용
     tokenizer = None
-    if USE_OFFLINE_CHAR_TOKENIZER:
+    if TOKENIZER_TYPE == "xlmr":
+        tokenizer = Tokenizer(
+            model_name="xlm-roberta-local",
+            tokenizer=HuggingFaceTokenizer(XLMR_TOKENIZER_PATH),
+        )
+    elif USE_OFFLINE_CHAR_TOKENIZER:
         tokenizer = Tokenizer(
             model_name="offline-char-tokenizer",
             tokenizer=OfflineCharTokenizer(),
@@ -250,6 +343,9 @@ async def initialize_rag() -> LightRAG:
         working_dir=str(WORKING_DIR),
         tokenizer=tokenizer,
         tiktoken_model_name=TIKTOKEN_MODEL,
+        chunk_token_size=CHUNK_TOKEN_SIZE,
+        chunk_overlap_token_size=CHUNK_OVERLAP_TOKEN_SIZE,
+        max_extract_input_tokens=MAX_EXTRACT_INPUT_TOKENS,
         # --- LLM 설정 ---
         llm_model_func=onprem_llm_complete,
         llm_model_name=LLM_MODEL,
@@ -278,6 +374,17 @@ async def index_document(rag: LightRAG) -> None:
     except Exception:
         print("인덱싱 실패: 임베딩/LLM 설정을 확인하세요.\n")
         raise
+    chunks_file = WORKING_DIR / "vdb_chunks.json"
+    if not chunks_file.exists():
+        raise RuntimeError("인덱싱 결과 파일(vdb_chunks.json)이 생성되지 않았습니다.")
+    try:
+        data = json.loads(chunks_file.read_text(encoding="utf-8"))
+        if not data.get("data"):
+            raise RuntimeError(
+                "인덱싱 결과 청크가 비어 있습니다. 상단 LLM/임베딩 오류 로그를 확인하세요."
+            )
+    except json.JSONDecodeError:
+        raise RuntimeError("인덱싱 결과 파일(vdb_chunks.json) 파싱에 실패했습니다.")
     print("인덱싱 완료\n")
 
 
@@ -294,7 +401,11 @@ async def run_query(rag: LightRAG, question: str, mode: str) -> None:
 
 
 async def main() -> None:
+    global BAD_EMBED_LOG_PATH
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    BAD_EMBED_LOG_PATH = Path(f"./bad_embed_inputs_{ts}.log")
     await ensure_ollama_embed_model()
+    await ensure_llm_gateway_ready()
     rag = await initialize_rag()
     await index_document(rag)
 
@@ -310,5 +421,15 @@ if __name__ == "__main__":
         raise SystemExit(
             "ONPREM_LLM_CREDENTIAL_KEY가 설정되지 않았습니다.\n"
             ".env.onprem 파일을 확인하세요."
+        )
+    if not LLM_SEND_SYSTEM_NAME:
+        raise SystemExit(
+            "ONPREM_SEND_SYSTEM_NAME가 설정되지 않았습니다.\n"
+            "DS API HUB에 등록된 Send-System-Name 값을 .env.onprem에 입력하세요."
+        )
+    if not LLM_USER_ID:
+        raise SystemExit(
+            "ONPREM_USER_ID가 설정되지 않았습니다.\n"
+            "사내 KNOX ID 값을 .env.onprem에 입력하세요."
         )
     asyncio.run(main())
