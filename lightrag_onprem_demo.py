@@ -128,7 +128,7 @@ async def onprem_llm_complete(*args, **kwargs) -> str:
     completion = await client.chat.completions.create(
         model=LLM_MODEL,
         messages=messages,
-        timeout=kwargs.pop("timeout", None),
+        timeout=kwargs.pop("timeout", 600),
     )
     return completion.choices[0].message.content or ""
 
@@ -181,11 +181,31 @@ async def onprem_rerank(
     return results
 
 
+MIN_EMBED_INPUT_LENGTH = int(os.getenv("ONPREM_MIN_EMBED_INPUT_LENGTH", "64"))
+
+import re as _re
+
+def _sanitize_embed_input(text: str) -> str:
+    """임베딩 입력 전처리: 특수 구분자 정규화 + 최소 길이 보장 (NaN 방지)."""
+    # 탭 → 공백, 연속 공백/개행 정리
+    text = text.replace("\t", " ")
+    text = _re.sub(r"\r\n|\r", "\n", text)
+    text = _re.sub(r" {2,}", " ", text)
+    text = text.strip()
+    # 짧은 입력은 의미 있는 접두어를 붙여 최소 길이 확보
+    # 단순 반복보다 다양한 토큰을 포함시켜 NaN 발생 확률을 낮춤
+    if len(text) < MIN_EMBED_INPUT_LENGTH:
+        text = f"The following is a description of: {text}. This term is relevant to semiconductor manufacturing yield analysis."
+    return text
+
+
 async def ollama_embed(texts: list[str]) -> np.ndarray:
     """
     폐쇄망 PC의 로컬 Ollama 임베딩 모델(bge-m3:latest 등)을 호출합니다.
+    입력 텍스트에 전처리(특수문자 정규화, 최소 길이 패딩)를 적용합니다.
     """
     endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
+    texts = [_sanitize_embed_input(t) for t in texts]
 
     async def _embed_batch(batch_texts: list[str]) -> list[list[float]]:
         payload = {"model": OLLAMA_EMBED_MODEL, "input": batch_texts}
