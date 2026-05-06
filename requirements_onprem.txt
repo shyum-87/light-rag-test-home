@@ -16,6 +16,10 @@ tokenizers==0.22.2
 huggingface-hub==1.13.0
 safetensors==0.7.0
 
+# --- MSSQL + 통계 (분석 시스템용) ---
+pymssql==2.3.13
+scipy==1.15.3
+
 # --- HTTP / async ---
 aiohttp==3.13.5
 aiohappyeyeballs==2.6.1
