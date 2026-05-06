@@ -1,0 +1,27 @@
+# config.yaml — Bin 불량 분석 시스템 설정
+# 환경변수는 ${VAR_NAME} 형태로 참조 (.env.onprem에서 로드)
+
+database:
+  driver: mssql
+  host: ${MSSQL_HOST}
+  port: 1433
+  database: ${MSSQL_DATABASE}
+  username: ${MSSQL_USER}
+  password: ${MSSQL_PASSWORD}
+
+safety:
+  allowed_statements: [SELECT, WITH]
+  blocked_keywords: [INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, EXEC, EXECUTE, MERGE, GRANT, REVOKE]
+  max_rows: 10000
+  # table_whitelist는 사용자가 테이블 스키마 제공 후 채울 것
+  table_whitelist: []
+
+execution:
+  mode: approval    # approval | auto
+  log_all_sql: true
+  log_path: ./logs/sql_execution.log
+
+lightrag:
+  working_dir: ./rag_storage_analysis
+  domain_docs_dir: ./docs/domain
+  embed_model_path: ./models/bge-m3-onnx
