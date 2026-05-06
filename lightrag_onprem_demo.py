@@ -2,11 +2,15 @@
 LightRAG 사내 폐쇄망 데모 스크립트
 ====================================
 사내 커스텀 LLM API (OpenAI-compatible + 커스텀 헤더 인증) 및
-사내 Reranker API를 사용하는 버전입니다.
+HuggingFace FlagEmbedding (BAAI/bge-m3) 로컬 임베딩을 사용하는 버전입니다.
+
+Ollama bge-m3에서 NaN/zero-vector 문제가 발생하여,
+FlagEmbedding으로 직접 임베딩하도록 변경했습니다.
 
 실행 전 준비:
-1. .env.onprem 파일을 열어 API 키/URL 등을 설정
-2. python lightrag_onprem_demo.py
+1. models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣을 것
+2. .env.onprem 파일을 열어 API 키/URL 등을 설정
+3. python lightrag_onprem_demo.py
 """
 
 import os
@@ -18,8 +22,6 @@ import logging
 import numpy as np
 import json
 import importlib
-from datetime import datetime
-from collections import Counter
 from pathlib import Path
 from openai import AsyncOpenAI
 
@@ -49,9 +51,9 @@ LLM_CREDENTIAL_KEY = os.getenv("ONPREM_LLM_CREDENTIAL_KEY", "")
 LLM_SEND_SYSTEM_NAME = os.getenv("ONPREM_SEND_SYSTEM_NAME", "")
 LLM_USER_ID = os.getenv("ONPREM_USER_ID", "")
 
-# 임베딩 — 현재 사내 임베딩 API 미구축 상태를 고려해 로컬 Ollama 사용
-OLLAMA_BASE_URL = os.getenv("ONPREM_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_EMBED_MODEL = os.getenv("ONPREM_OLLAMA_EMBED_MODEL", "bge-m3:latest")
+# 임베딩 — HuggingFace FlagEmbedding (로컬 bge-m3)
+EMBED_MODEL_PATH = os.getenv("ONPREM_EMBED_MODEL_PATH", "./models/bge-m3")
+EMBED_USE_GPU = os.getenv("ONPREM_EMBED_USE_GPU", "true").lower() == "true"
 EMBED_DIM = int(os.getenv("ONPREM_EMBED_DIM", "1024"))
 CHUNK_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_TOKEN_SIZE", "800"))
 CHUNK_OVERLAP_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_OVERLAP_TOKEN_SIZE", "80"))
@@ -79,7 +81,6 @@ RERANK_TOP_N = int(os.getenv("ONPREM_RERANK_TOP_N", "5"))
 # ------------------------------------------------------------------
 WORKING_DIR = Path("./rag_storage_onprem")
 DOC_PATH = Path("./sample_doc.txt")
-BAD_EMBED_LOG_PATH: Path | None = None
 
 setup_logger("lightrag", level="WARNING")
 
@@ -181,113 +182,83 @@ async def onprem_rerank(
     return results
 
 
-MIN_EMBED_INPUT_LENGTH = int(os.getenv("ONPREM_MIN_EMBED_INPUT_LENGTH", "64"))
-
-import re as _re
-
-def _sanitize_embed_input(text: str) -> str:
-    """임베딩 입력 전처리: 특수 구분자 정규화 + 최소 길이 보장 (NaN 방지)."""
-    # 탭 → 공백, 연속 공백/개행 정리
-    text = text.replace("\t", " ")
-    text = _re.sub(r"\r\n|\r", "\n", text)
-    text = _re.sub(r" {2,}", " ", text)
-    text = text.strip()
-    # 짧은 입력은 의미 있는 접두어를 붙여 최소 길이 확보
-    # 단순 반복보다 다양한 토큰을 포함시켜 NaN 발생 확률을 낮춤
-    if len(text) < MIN_EMBED_INPUT_LENGTH:
-        text = f"The following is a description of: {text}. This term is relevant to semiconductor manufacturing yield analysis."
-    return text
+# ------------------------------------------------------------------
+# FlagEmbedding 로컬 임베딩 (Ollama 서빙 경로 NaN 문제 해결)
+# ------------------------------------------------------------------
+_flag_model = None
 
 
-async def ollama_embed(texts: list[str]) -> np.ndarray:
-    """
-    폐쇄망 PC의 로컬 Ollama 임베딩 모델(bge-m3:latest 등)을 호출합니다.
-    입력 텍스트에 전처리(특수문자 정규화, 최소 길이 패딩)를 적용합니다.
-    """
-    endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
-    texts = [_sanitize_embed_input(t) for t in texts]
+def _get_flag_model():
+    """BGEM3FlagModel을 한 번만 로드하고 재사용한다."""
+    global _flag_model
+    if _flag_model is None:
+        from FlagEmbedding import BGEM3FlagModel
 
-    async def _embed_batch(batch_texts: list[str]) -> list[list[float]]:
-        payload = {"model": OLLAMA_EMBED_MODEL, "input": batch_texts}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(endpoint, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise RuntimeError(
-                        f"Ollama embed API error {resp.status}: {error_text}"
-                    )
-                data = await resp.json()
-        embeddings = data.get("embeddings")
-        if not embeddings:
-            raise RuntimeError(f"Ollama embed 응답에 embeddings가 없습니다: {data}")
-        return embeddings
-
-    try:
-        arr = np.array(await _embed_batch(texts), dtype=np.float32)
-        if not np.isfinite(arr).all():
-            raise RuntimeError("Ollama 임베딩 결과에 NaN/Inf가 포함되었습니다.")
-        return arr
-    except Exception as e:
-        msg = str(e)
-        if "unsupported value: NaN" not in msg and "NaN" not in msg:
-            logger.error(f"Ollama embed API error: {e}")
-            raise
-
-        logger.warning(
-            "Ollama 배치 임베딩에서 NaN 오류 발생. 단건 임베딩 fallback을 시도합니다."
-        )
-        vectors: list[np.ndarray] = []
-        bad_inputs: list[str] = []
-        for t in texts:
-            try:
-                single_arr = np.array(await _embed_batch([t]), dtype=np.float32)
-                vec = single_arr[0]
-                if not np.isfinite(vec).all():
-                    raise RuntimeError("single embedding contains NaN/Inf")
-                vectors.append(vec)
-            except Exception as single_e:
-                logger.error(
-                    f"단건 임베딩도 실패하여 zero-vector로 대체합니다: {single_e}"
-                )
-                bad_inputs.append(t)
-                vectors.append(np.zeros(EMBED_DIM, dtype=np.float32))
-        if bad_inputs:
-            target_log = BAD_EMBED_LOG_PATH or Path("./bad_embed_inputs.log")
-            counter = Counter(bad_inputs)
-            with target_log.open("a", encoding="utf-8") as f:
-                f.write("\n=== zero-vector fallback batch ===\n")
-                for idx, bad in enumerate(bad_inputs, start=1):
-                    f.write(f"[{idx}] {bad}\n")
-                f.write("--- count summary ---\n")
-                for text, cnt in counter.most_common():
-                    f.write(f"{cnt}x | {text}\n")
-            logger.warning(
-                f"zero-vector로 대체된 입력 {len(bad_inputs)}건을 {target_log}에 기록했습니다."
+        model_path = EMBED_MODEL_PATH
+        if not Path(model_path).exists():
+            raise RuntimeError(
+                f"임베딩 모델 경로가 존재하지 않습니다: {model_path}\n"
+                "models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣어주세요.\n"
+                "다운로드: huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3"
             )
-        return np.vstack(vectors)
+
+        device = "cuda" if EMBED_USE_GPU else "cpu"
+        logger.info(f"FlagEmbedding loading: {model_path} (device={device})")
+        _flag_model = BGEM3FlagModel(
+            model_path,
+            use_fp16=EMBED_USE_GPU,
+            device=device,
+        )
+        logger.info("FlagEmbedding model loaded")
+    return _flag_model
 
 
-async def ensure_ollama_embed_model() -> None:
+async def flag_embed(texts: list[str]) -> np.ndarray:
     """
-    시작 전에 로컬 Ollama 모델 존재 여부를 확인해 404를 사전에 방지합니다.
+    HuggingFace FlagEmbedding(BAAI/bge-m3)으로 텍스트를 임베딩한다.
+    Ollama 서빙 경로를 우회하여 NaN 문제를 방지한다.
     """
-    endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(endpoint) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(
-                    f"Ollama 연결 실패({resp.status}): {body}\n"
-                    f"- ONPREM_OLLAMA_BASE_URL 확인: {OLLAMA_BASE_URL}"
-                )
-            data = await resp.json()
+    model = _get_flag_model()
 
-    model_names = {m.get("name", "") for m in data.get("models", [])}
-    if OLLAMA_EMBED_MODEL not in model_names:
+    result = model.encode(
+        texts,
+        batch_size=32,
+        max_length=8192,
+    )
+
+    # BGEM3FlagModel.encode()는 dict 또는 numpy array를 반환
+    if isinstance(result, dict):
+        embeddings = result["dense_vecs"]
+    else:
+        embeddings = result
+
+    embeddings = np.array(embeddings, dtype=np.float32)
+
+    # NaN 진단 로그
+    nan_mask = np.isnan(embeddings).any(axis=1)
+    if nan_mask.any():
+        nan_indices = np.where(nan_mask)[0]
+        logger.warning(f"FlagEmbedding NaN detected at indices: {nan_indices.tolist()}")
+        for idx in nan_indices:
+            logger.warning(f"  [{idx}] {texts[idx][:80]}...")
+        embeddings = np.nan_to_num(embeddings, nan=0.0)
+
+    return embeddings
+
+
+def ensure_embed_model() -> None:
+    """시작 전에 로컬 모델 경로 존재 여부를 확인한다."""
+    model_path = Path(EMBED_MODEL_PATH)
+    if not model_path.exists():
         raise RuntimeError(
-            f"Ollama 모델 '{OLLAMA_EMBED_MODEL}' 이(가) 없습니다.\n"
-            f"사내 PC에서 먼저 실행하세요: ollama pull {OLLAMA_EMBED_MODEL}\n"
-            f"현재 설치 모델: {sorted([n for n in model_names if n])}"
+            f"임베딩 모델 경로가 존재하지 않습니다: {EMBED_MODEL_PATH}\n"
+            "models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣어주세요."
+        )
+    # 최소한 config.json이 있어야 모델로 인식
+    if not (model_path / "config.json").exists():
+        raise RuntimeError(
+            f"{EMBED_MODEL_PATH}에 config.json이 없습니다.\n"
+            "HuggingFace 모델 파일이 올바르게 다운로드되었는지 확인하세요."
         )
 
 
@@ -370,11 +341,11 @@ async def initialize_rag() -> LightRAG:
         llm_model_func=onprem_llm_complete,
         llm_model_name=LLM_MODEL,
         llm_model_kwargs={},
-        # --- 임베딩 설정 (로컬 Ollama) ---
+        # --- 임베딩 설정 (로컬 FlagEmbedding) ---
         embedding_func=EmbeddingFunc(
             embedding_dim=EMBED_DIM,
             max_token_size=8192,
-            func=ollama_embed,
+            func=flag_embed,
         ),
         # --- Reranker 설정 (선택) ---
         rerank_model_func=onprem_rerank if RERANK_CREDENTIAL_KEY else None,
@@ -421,10 +392,7 @@ async def run_query(rag: LightRAG, question: str, mode: str) -> None:
 
 
 async def main() -> None:
-    global BAD_EMBED_LOG_PATH
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    BAD_EMBED_LOG_PATH = Path(f"./bad_embed_inputs_{ts}.log")
-    await ensure_ollama_embed_model()
+    ensure_embed_model()
     await ensure_llm_gateway_ready()
     rag = await initialize_rag()
     await index_document(rag)
