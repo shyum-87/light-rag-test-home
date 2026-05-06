@@ -16,11 +16,9 @@ rag_storage_ollama/
 rag_storage_onprem/
 rag_storage_flagembed/
 
-# 임베딩 모델 (용량 큼, USB로 별도 복사)
-models/bge-m3/*.safetensors
-models/bge-m3/*.bin
-models/bge-m3/*.pt
-models/bge-m3/model.*
+# ONNX 임베딩 모델 (용량 큼, USB로 별도 복사 — README만 git 포함)
+models/bge-m3-onnx/*
+!models/bge-m3-onnx/README.md
 
 # NaN 진단 로그
 bad_embed_inputs_*.log

@@ -2,13 +2,14 @@
 LightRAG 사내 폐쇄망 데모 스크립트
 ====================================
 사내 커스텀 LLM API (OpenAI-compatible + 커스텀 헤더 인증) 및
-HuggingFace FlagEmbedding (BAAI/bge-m3) 로컬 임베딩을 사용하는 버전입니다.
+ONNX Runtime (BAAI/bge-m3) 로컬 임베딩을 사용하는 버전입니다.
 
 Ollama bge-m3에서 NaN/zero-vector 문제가 발생하여,
-FlagEmbedding으로 직접 임베딩하도록 변경했습니다.
+ONNX Runtime으로 직접 임베딩하도록 변경했습니다. (torch 불필요)
 
 실행 전 준비:
-1. models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣을 것
+1. models/bge-m3-onnx/ 폴더에 ONNX 변환된 모델 파일을 넣을 것
+   (변환: optimum-cli export onnx --model BAAI/bge-m3 ./models/bge-m3-onnx)
 2. .env.onprem 파일을 열어 API 키/URL 등을 설정
 3. python lightrag_onprem_demo.py
 """
@@ -51,9 +52,8 @@ LLM_CREDENTIAL_KEY = os.getenv("ONPREM_LLM_CREDENTIAL_KEY", "")
 LLM_SEND_SYSTEM_NAME = os.getenv("ONPREM_SEND_SYSTEM_NAME", "")
 LLM_USER_ID = os.getenv("ONPREM_USER_ID", "")
 
-# 임베딩 — HuggingFace FlagEmbedding (로컬 bge-m3)
-EMBED_MODEL_PATH = os.getenv("ONPREM_EMBED_MODEL_PATH", "./models/bge-m3")
-EMBED_USE_GPU = os.getenv("ONPREM_EMBED_USE_GPU", "true").lower() == "true"
+# 임베딩 — ONNX Runtime (로컬 bge-m3-onnx, torch 불필요)
+EMBED_MODEL_PATH = os.getenv("ONPREM_EMBED_MODEL_PATH", "./models/bge-m3-onnx")
 EMBED_DIM = int(os.getenv("ONPREM_EMBED_DIM", "1024"))
 CHUNK_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_TOKEN_SIZE", "800"))
 CHUNK_OVERLAP_TOKEN_SIZE = int(os.getenv("ONPREM_CHUNK_OVERLAP_TOKEN_SIZE", "80"))
@@ -183,62 +183,75 @@ async def onprem_rerank(
 
 
 # ------------------------------------------------------------------
-# FlagEmbedding 로컬 임베딩 (Ollama 서빙 경로 NaN 문제 해결)
+# ONNX Runtime 로컬 임베딩 (torch 불필요, Ollama NaN 문제 해결)
 # ------------------------------------------------------------------
-_flag_model = None
+_ort_session = None
+_ort_tokenizer = None
 
 
-def _get_flag_model():
-    """BGEM3FlagModel을 한 번만 로드하고 재사용한다."""
-    global _flag_model
-    if _flag_model is None:
-        from FlagEmbedding import BGEM3FlagModel
+def _get_ort_model():
+    """ONNX Runtime 세션과 토크나이저를 한 번만 로드하고 재사용한다."""
+    global _ort_session, _ort_tokenizer
+    if _ort_session is None:
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
 
-        model_path = EMBED_MODEL_PATH
-        if not Path(model_path).exists():
+        model_path = Path(EMBED_MODEL_PATH)
+        onnx_file = model_path / "model.onnx"
+        if not onnx_file.exists():
             raise RuntimeError(
-                f"임베딩 모델 경로가 존재하지 않습니다: {model_path}\n"
-                "models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣어주세요.\n"
-                "다운로드: huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3"
+                f"ONNX 모델 파일이 없습니다: {onnx_file}\n"
+                "인터넷 PC에서 변환 후 복사하세요:\n"
+                "  optimum-cli export onnx --model BAAI/bge-m3 ./models/bge-m3-onnx"
             )
 
-        device = "cuda" if EMBED_USE_GPU else "cpu"
-        logger.info(f"FlagEmbedding loading: {model_path} (device={device})")
-        _flag_model = BGEM3FlagModel(
-            model_path,
-            use_fp16=EMBED_USE_GPU,
-            device=device,
+        logger.info(f"ONNX Runtime loading: {model_path}")
+        _ort_session = ort.InferenceSession(str(onnx_file))
+        _ort_tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True
         )
-        logger.info("FlagEmbedding model loaded")
-    return _flag_model
+        logger.info("ONNX Runtime model loaded")
+    return _ort_session, _ort_tokenizer
 
 
-async def flag_embed(texts: list[str]) -> np.ndarray:
+async def onnx_embed(texts: list[str]) -> np.ndarray:
     """
-    HuggingFace FlagEmbedding(BAAI/bge-m3)으로 텍스트를 임베딩한다.
-    Ollama 서빙 경로를 우회하여 NaN 문제를 방지한다.
+    ONNX Runtime으로 bge-m3 텍스트 임베딩을 수행한다.
+    torch 없이 동작하며, Ollama 서빙 경로의 NaN 문제를 근본적으로 해결한다.
     """
-    model = _get_flag_model()
+    session, tokenizer = _get_ort_model()
+    input_names = [i.name for i in session.get_inputs()]
 
-    result = model.encode(
-        texts,
-        batch_size=32,
-        max_length=8192,
-    )
+    all_embeddings = []
+    batch_size = 32
 
-    # BGEM3FlagModel.encode()는 dict 또는 numpy array를 반환
-    if isinstance(result, dict):
-        embeddings = result["dense_vecs"]
-    else:
-        embeddings = result
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        inputs = tokenizer(
+            batch,
+            return_tensors="np",
+            padding=True,
+            truncation=True,
+            max_length=8192,
+        )
+        feeds = {k: v for k, v in inputs.items() if k in input_names}
+        outputs = session.run(None, feeds)
+        # CLS 토큰 (첫 번째 토큰)의 hidden state를 임베딩으로 사용
+        cls_embeddings = outputs[0][:, 0, :]
+        all_embeddings.append(cls_embeddings)
 
-    embeddings = np.array(embeddings, dtype=np.float32)
+    embeddings = np.vstack(all_embeddings).astype(np.float32)
+
+    # L2 정규화 (bge-m3 dense embedding 표준)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    embeddings = embeddings / norms
 
     # NaN 진단 로그
     nan_mask = np.isnan(embeddings).any(axis=1)
     if nan_mask.any():
         nan_indices = np.where(nan_mask)[0]
-        logger.warning(f"FlagEmbedding NaN detected at indices: {nan_indices.tolist()}")
+        logger.warning(f"ONNX embed NaN detected at indices: {nan_indices.tolist()}")
         for idx in nan_indices:
             logger.warning(f"  [{idx}] {texts[idx][:80]}...")
         embeddings = np.nan_to_num(embeddings, nan=0.0)
@@ -247,18 +260,23 @@ async def flag_embed(texts: list[str]) -> np.ndarray:
 
 
 def ensure_embed_model() -> None:
-    """시작 전에 로컬 모델 경로 존재 여부를 확인한다."""
+    """시작 전에 ONNX 모델 경로와 필수 파일 존재 여부를 확인한다."""
     model_path = Path(EMBED_MODEL_PATH)
     if not model_path.exists():
         raise RuntimeError(
             f"임베딩 모델 경로가 존재하지 않습니다: {EMBED_MODEL_PATH}\n"
-            "models/bge-m3/ 폴더에 HuggingFace 모델 파일을 넣어주세요."
+            "models/bge-m3-onnx/ 폴더에 ONNX 모델 파일을 넣어주세요.\n"
+            "변환: optimum-cli export onnx --model BAAI/bge-m3 ./models/bge-m3-onnx"
         )
-    # 최소한 config.json이 있어야 모델로 인식
-    if not (model_path / "config.json").exists():
+    if not (model_path / "model.onnx").exists():
         raise RuntimeError(
-            f"{EMBED_MODEL_PATH}에 config.json이 없습니다.\n"
-            "HuggingFace 모델 파일이 올바르게 다운로드되었는지 확인하세요."
+            f"{EMBED_MODEL_PATH}에 model.onnx가 없습니다.\n"
+            "ONNX 모델이 올바르게 변환/복사되었는지 확인하세요."
+        )
+    if not (model_path / "tokenizer.json").exists():
+        raise RuntimeError(
+            f"{EMBED_MODEL_PATH}에 tokenizer.json이 없습니다.\n"
+            "ONNX 변환 시 토크나이저도 함께 저장되어야 합니다."
         )
 
 
@@ -341,11 +359,11 @@ async def initialize_rag() -> LightRAG:
         llm_model_func=onprem_llm_complete,
         llm_model_name=LLM_MODEL,
         llm_model_kwargs={},
-        # --- 임베딩 설정 (로컬 FlagEmbedding) ---
+        # --- 임베딩 설정 (ONNX Runtime, torch 불필요) ---
         embedding_func=EmbeddingFunc(
             embedding_dim=EMBED_DIM,
             max_token_size=8192,
-            func=flag_embed,
+            func=onnx_embed,
         ),
         # --- Reranker 설정 (선택) ---
         rerank_model_func=onprem_rerank if RERANK_CREDENTIAL_KEY else None,
