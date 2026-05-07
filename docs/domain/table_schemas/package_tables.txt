@@ -1,0 +1,27 @@
+# 패키지 공정 테이블 스키마
+
+## 안내
+이 파일에 실제 사내 테이블 스키마를 작성해주세요.
+아래는 작성 예시 형식입니다. 실제 테이블명과 컬럼으로 교체하세요.
+
+## 예시 형식
+
+### 테이블: EXAMPLE_BIN_RESULT
+용도: 최종 테스트 Bin 결과 테이블
+
+| 컬럼명 | 타입 | 설명 |
+|--------|------|------|
+| LOT_ID | VARCHAR | Lot 식별자 |
+| EQP_ID | VARCHAR | 설비 식별자 |
+| CHAMBER_ID | VARCHAR | 챔버/위치 식별자 |
+| BIN_CODE | INT | Bin 코드 (1=양품, 2~=불량유형) |
+| TEST_DATE | DATETIME | 테스트 일시 |
+| PROCESS_ID | VARCHAR | 공정 코드 |
+
+### 테이블 간 조인 관계
+- [테이블A] ↔ [테이블B]: LOT_ID로 조인
+- [테이블B] ↔ [테이블C]: LOT_ID + WAFER_ID로 조인
+
+## 주의사항
+- config.yaml의 safety.table_whitelist에 여기 적힌 테이블명을 등록해야 합니다
+- 스키마가 정확할수록 LLM의 SQL 생성 품질이 높아집니다
